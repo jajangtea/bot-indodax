@@ -392,6 +392,187 @@ async function getAccountInfo() {
    TRADE HISTORY SYNC - PERBAIKAN DAILY LOSS
 ====================================================== */
 
+/* ======================================================
+   TRADE HISTORY SYNC - FIXED VERSION
+====================================================== */
+
+async function syncTradeHistory() {
+    try {
+        console.log("\n📊 Syncing trade history for ALL pairs...");
+        
+        // Get all pairs that we might have traded
+        const response = await axios.get(PUBLIC_URL, { timeout: 15000 });
+        const tickers = response.data.tickers || {};
+        
+        // Get all IDR pairs
+        const allPairs = Object.keys(tickers).filter(pair => pair.endsWith('_idr'));
+        console.log(`   Found ${allPairs.length} IDR pairs to check`);
+        
+        let allTrades = [];
+        let pairsChecked = 0;
+
+        // Check trade history for each pair
+        for (const pair of allPairs) {
+            try {
+                // Skip if rate limited
+                if (pairsChecked > 0 && pairsChecked % 10 === 0) {
+                    console.log(`   Progress: ${pairsChecked}/${allPairs.length} pairs...`);
+                    await sleep(3000); // Delay every 10 pairs to avoid rate limit
+                }
+
+                const response = await privateRequest('tradeHistory', {
+                    pair: pair,
+                    count: 50, // Get last 50 trades per pair
+                    order: 'desc'
+                });
+
+                if (response.success && response.data.trades && response.data.trades.length > 0) {
+                    allTrades = allTrades.concat(response.data.trades);
+                    
+                    // Debug: show if we found trades
+                    if (response.data.trades.length > 0) {
+                        console.log(`   📊 ${pair}: ${response.data.trades.length} trades found`);
+                    }
+                }
+
+                pairsChecked++;
+                await sleep(1000); // Small delay between requests
+
+            } catch (e) {
+                console.log(`   ⚠️ Error checking ${pair}: ${e.message}`);
+                continue;
+            }
+        }
+
+        // Calculate today's P&L
+        const today = Math.floor(Date.now() / 1000) - (24 * 60 * 60);
+        let dailyPL = 0;
+        let tradeCount = 0;
+        let tradeDetails = [];
+
+        console.log("\n📈 Calculating daily P&L from", allTrades.length, "total trades...");
+
+        allTrades.forEach(trade => {
+            if (trade.trade_time >= today) {
+                // Get the quantity key (varies by pair)
+                const qtyKey = Object.keys(trade).find(key => 
+                    key !== 'trade_id' && 
+                    key !== 'order_id' && 
+                    key !== 'type' && 
+                    key !== 'price' && 
+                    key !== 'trade_time' && 
+                    key !== 'fee' && 
+                    key !== 'pair' &&
+                    !key.includes('_idr')
+                );
+
+                if (!qtyKey) return;
+
+                const price = Number(trade.price);
+                const qty = Number(trade[qtyKey]);
+                const fee = Number(trade.fee || 0);
+
+                // Skip invalid data
+                if (isNaN(price) || isNaN(qty) || price <= 0 || qty <= 0) return;
+
+                const tradeValue = price * qty;
+                
+                // Calculate P&L for this trade
+                let pl = 0;
+                if (trade.type === 'sell') {
+                    // For sell: revenue minus fee
+                    pl = tradeValue - fee;
+                    
+                    tradeDetails.push({
+                        pair: trade.pair || 'unknown',
+                        type: 'sell',
+                        value: tradeValue,
+                        fee: fee,
+                        pl: pl
+                    });
+                } else {
+                    // For buy: only fee is loss
+                    pl = -fee;
+                    
+                    tradeDetails.push({
+                        pair: trade.pair || 'unknown',
+                        type: 'buy',
+                        value: tradeValue,
+                        fee: fee,
+                        pl: pl
+                    });
+                }
+
+                dailyPL += pl;
+                tradeCount++;
+            }
+        });
+
+        // Show detailed breakdown
+        if (tradeDetails.length > 0) {
+            console.log("\n📊 Today's Trade Breakdown:");
+            let buyTotal = 0, sellTotal = 0, feeTotal = 0;
+            
+            tradeDetails.forEach(t => {
+                if (t.type === 'sell') {
+                    sellTotal += t.value;
+                } else {
+                    buyTotal += t.value;
+                }
+                feeTotal += t.fee;
+                
+                console.log(`   ${t.pair} | ${t.type} | Value: Rp ${formatIDR(t.value)} | Fee: Rp ${formatIDR(t.fee)} | P&L: Rp ${formatIDR(t.pl)}`);
+            });
+            
+            console.log(`\n📊 Summary:`);
+            console.log(`   Total Buy Value: Rp ${formatIDR(buyTotal)}`);
+            console.log(`   Total Sell Value: Rp ${formatIDR(sellTotal)}`);
+            console.log(`   Total Fees: Rp ${formatIDR(feeTotal)}`);
+        }
+
+        // ===== VALIDASI DAILY PL =====
+        // Pastikan dailyPL tidak melebihi batas wajar
+        const MAX_REASONABLE_LOSS = state.equityNow * 2;
+
+        if (Math.abs(dailyPL) > MAX_REASONABLE_LOSS) {
+            console.log(`⚠️ Daily PL tidak wajar: Rp ${formatIDR(dailyPL)}`);
+            console.log(`   Equity saat ini: Rp ${formatIDR(state.equityNow)}`);
+            console.log(`   Trade count: ${tradeCount}`);
+            console.log(`   ⚠️ RESET ke 0 karena kemungkinan error data`);
+            dailyPL = 0;
+        }
+
+        // Validasi tambahan: jika dailyPL > equity, kemungkinan error
+        if (Math.abs(dailyPL) > state.equityNow) {
+            console.log(`⚠️ Daily PL (${formatIDR(Math.abs(dailyPL))}) > equity (${formatIDR(state.equityNow)})`);
+            console.log(`   ⚠️ Menggunakan nilai yang lebih kecil`);
+            dailyPL = Math.min(Math.abs(dailyPL), state.equityNow) * (dailyPL >= 0 ? 1 : -1);
+        }
+
+        // Pastikan dailyLoss tidak negatif (harus absolute)
+        const newDailyLoss = Math.abs(dailyPL);
+
+        // Validasi final: pastikan tidak ada angka aneh
+        if (isNaN(newDailyLoss) || !isFinite(newDailyLoss) || newDailyLoss < 0) {
+            console.log(`❌ Daily loss tidak valid, reset ke 0`);
+            state.dailyLoss = 0;
+        } else {
+            state.dailyLoss = newDailyLoss;
+        }
+
+        console.log(`\n📊 FINAL DAILY P&L: Rp ${formatIDR(dailyPL)} (${tradeCount} trades)`);
+        console.log(`📊 DAILY LOSS TERSIMPAN: Rp ${formatIDR(state.dailyLoss)}`);
+
+        tradeHistoryCache.lastSync = Date.now();
+
+    } catch (e) {
+        console.log("❌ Trade history sync error:", e.message);
+        console.log(e.stack); // Add stack trace for debugging
+
+        // Jika error, set dailyLoss ke 0 untuk keamanan
+        state.dailyLoss = 0;
+    }
+}
 
 /* ======================================================
    PLACE ORDER
@@ -1830,205 +2011,38 @@ async function processTelegramCommand(chatId, command) {
    MAIN SCANNER LOOP - OPTIMIZED WITH MULTI-TF
 ====================================================== */
 
-/* ======================================================
-   SMART TRADE HISTORY SYNC - HANYA PAIR YANG PERNAH DITRADE
-====================================================== */
-
-async function syncTradeHistory() {
-    try {
-        console.log("\n📊 Syncing trade history for ACTIVE pairs only...");
-
-        // ===== 1. AMBIL DAFTAR PAIR YANG PERNAH DITRADE =====
-        // Dari state.positions (posisi aktif)
-        // Dari state.tradeHistory (history sebelumnya)
-        // Dari state.cooldown (pair yang pernah ditrade)
-
-        const activePairs = new Set();
-
-        // Tambahkan dari posisi aktif
-        Object.keys(state.positions).forEach(p => activePairs.add(p));
-
-        // Tambahkan dari cooldown (pair yang pernah ditrade)
-        Object.keys(state.cooldown).forEach(p => activePairs.add(p));
-
-        // Tambahkan dari trade history (100 trade terakhir)
-        if (state.tradeHistory && state.tradeHistory.length > 0) {
-            state.tradeHistory.slice(-100).forEach(t => {
-                if (t.pair) activePairs.add(t.pair);
-            });
-        }
-
-        // Selalu tambahkan pair yang sering ditradingkan
-        const commonPairs = ['pepe_idr', 'jellyjelly_idr', 'fartcoin_idr', 'pengu_idr', 'pippin_idr'];
-        commonPairs.forEach(p => activePairs.add(p));
-
-        console.log(`   Found ${activePairs.size} active pairs to check`);
-
-        let allTrades = [];
-        let pairsChecked = 0;
-
-        // ===== 2. SYNC HANYA UNTUK PAIR AKTIF =====
-        for (const pair of activePairs) {
-            try {
-                // Skip jika bukan IDR pair
-                if (!pair.endsWith('_idr')) continue;
-
-                const response = await privateRequest('tradeHistory', {
-                    pair: pair,
-                    count: 20, // Kurangi jadi 20 per pair
-                    order: 'desc'
-                });
-
-                if (response.success && response.data.trades && response.data.trades.length > 0) {
-                    allTrades = allTrades.concat(response.data.trades);
-
-                    // Log hanya jika ada trades
-                    console.log(`   📊 ${pair}: ${response.data.trades.length} trades found`);
-                }
-
-                pairsChecked++;
-
-                // Delay kecil antar request
-                await sleep(500);
-
-            } catch (e) {
-                console.log(`   ⚠️ Error checking ${pair}: ${e.message}`);
-                continue;
-            }
-        }
-
-        // ===== 3. HITUNG DAILY P&L =====
-        const today = Math.floor(Date.now() / 1000) - (24 * 60 * 60);
-        let dailyPL = 0;
-        let tradeCount = 0;
-
-        allTrades.forEach(trade => {
-            if (trade.trade_time >= today) {
-                const price = Number(trade.price);
-                const qtyKey = Object.keys(trade).find(key =>
-                    key !== 'trade_id' && key !== 'order_id' && key !== 'type' &&
-                    key !== 'price' && key !== 'trade_time' && key !== 'fee' && key !== 'pair'
-                );
-
-                if (!qtyKey) return;
-
-                const qty = Number(trade[qtyKey]);
-                const fee = Number(trade.fee || 0);
-
-                if (isNaN(price) || isNaN(qty) || price <= 0 || qty <= 0) return;
-
-                const tradeValue = price * qty;
-                let pl = trade.type === 'sell' ? tradeValue - fee : -fee;
-
-                dailyPL += pl;
-                tradeCount++;
-            }
-        });
-
-        // ===== 4. VALIDASI & SIMPAN =====
-        state.dailyLoss = Math.abs(dailyPL);
-
-        console.log(`\n📊 FINAL DAILY P&L: Rp ${formatIDR(dailyPL)} (${tradeCount} trades)`);
-        console.log(`📊 DAILY LOSS TERSIMPAN: Rp ${formatIDR(state.dailyLoss)}`);
-
-        tradeHistoryCache.lastSync = Date.now();
-
-    } catch (e) {
-        console.log("❌ Trade history sync error:", e.message);
-    }
-}
-
-/* ======================================================
-   SMART PAIR SELECTION - HANYA ANALISIS PAIR POTENSIAL
-====================================================== */
-
-function getHighPotentialPairs(tickers) {
-    const highPotential = [];
-    const allPairs = Object.keys(tickers).filter(p => p.endsWith("_idr"));
-
-    // Filter 1: Volume tinggi (top 30% dari semua pair)
-    const pairsWithVolume = allPairs.map(pair => ({
-        pair,
-        volume: Number(tickers[pair]?.vol_idr || 0)
-    }));
-
-    pairsWithVolume.sort((a, b) => b.volume - a.volume);
-
-    // Ambil top 30% berdasarkan volume
-    const volumeThreshold = Math.ceil(allPairs.length * 0.3);
-    const highVolumePairs = new Set(
-        pairsWithVolume.slice(0, volumeThreshold).map(p => p.pair)
-    );
-
-    // Filter 2: Harga bergerak (volatility)
-    for (const pair of allPairs) {
-        const base = pair.split("_")[0];
-
-        // Skip blacklist
-        if (BLACKLIST.has(base)) continue;
-
-        // Skip jika di cooldown
-        if (Date.now() - (state.cooldown[pair] || 0) < CONFIG.COOLDOWN_MIN * 60000) continue;
-
-        // Skip jika sudah punya posisi
-        if (state.positions[pair]) continue;
-
-        const t = tickers[pair];
-        const volume = Number(t.vol_idr || 0);
-        const price = Number(t.last || 0);
-        const high = Number(t.high || 0);
-        const low = Number(t.low || 0);
-
-        // Filter volume minimal
-        if (volume < CONFIG.MIN_VOL_24H) continue;
-
-        // Hitung volatility
-        if (high > 0 && low > 0) {
-            const volatility = ((high - low) / low) * 100;
-
-            // Hanya pair dengan pergerakan harga signifikan
-            if (volatility > 2.0) { // Minimal pergerakan 2%
-                highPotential.push(pair);
-            }
-        }
-    }
-
-    // Prioritaskan pair dengan volume tinggi
-    const prioritized = highPotential.filter(p => highVolumePairs.has(p));
-
-    console.log(`\n🎯 High potential pairs: ${prioritized.length} dari ${allPairs.length} total`);
-
-    return prioritized.slice(0, 30); // Maksimal 30 pair per scan
-}
-
-/* ======================================================
-   OPTIMIZED SCAN FUNCTION
-====================================================== */
 
 async function scan() {
     try {
         const sekarang = Date.now();
-
-        // ===== 1. TASK BERKALA (JARANG) =====
-        // Cleanup setiap 30 menit
         if (!lastCleanup || sekarang - lastCleanup > 30 * 60 * 1000) {
             await cleanupRemainingCoins();
             lastCleanup = sekarang;
         }
-
-        // Sync trade history setiap 15 menit (bukan 5 menit)
-        if (sekarang - tradeHistoryCache.lastSync > 15 * 60 * 1000) {
-            await syncTradeHistory();
-        }
-
-        // ===== 2. CEK PERINTAH TELEGRAM =====
         await handleTelegramCommands();
 
-        // ===== 3. AMBIL DATA AKUN =====
+        for (const [pair, pos] of Object.entries(state.positions)) {
+            if (!pos.currentStop) {
+                console.log(`🔄 Migrasi posisi ${pair}: menambahkan currentStop`);
+                state.positions[pair].currentStop = pos.stop;
+                saveState();
+            }
+        }
+
+        const now = Date.now();
+        if (now - tradeHistoryCache.lastSync > CONFIG.TRADE_HISTORY_SYNC_INTERVAL) {
+            await syncTradeHistory();
+
+            const today = new Date().toDateString();
+            if (state.lastDate !== today) {
+                console.log("📅 New day detected");
+                state.lastDate = today;
+            }
+        }
+
         await getAccountInfo();
 
-        // ===== 4. AMBIL DATA MARKET =====
-        const response = await axios.get(PUBLIC_URL, { timeout: 10000 });
+        const response = await axios.get(PUBLIC_URL, { timeout: 15000 });
         if (!response.data || !response.data.tickers) {
             setTimeout(scan, CONFIG.SCAN_INTERVAL);
             return;
@@ -2036,39 +2050,32 @@ async function scan() {
 
         const tickers = response.data.tickers;
 
-        // ===== 5. UPDATE MEMORY HANYA UNTUK PAIR PENTING =====
-        const importantPairs = new Set([
-            ...Object.keys(state.positions),
-            ...getHighPotentialPairs(tickers)
-        ]);
-
-        for (const pair of importantPairs) {
-            const t = tickers[pair];
-            if (!t) continue;
+        for (const [pair, t] of Object.entries(tickers)) {
+            if (!pair.endsWith("_idr")) continue;
 
             const price = Number(t.last || 0);
             const volume = Number(t.vol_idr || 0);
 
             if (price > 0) {
-                state.priceMemory[pair] = [...(state.priceMemory[pair] || []), price].slice(-30);
+                state.priceMemory[pair] = [...(state.priceMemory[pair] || []), price].slice(-50);
                 state.volMemory[pair] = [...(state.volMemory[pair] || []), volume].slice(-20);
             }
         }
 
-        // ===== 6. DETEKSI MARKET REGIME =====
         const marketRegime = analyzer.detectMarketRegime(tickers);
-
-        // ===== 7. MANAGE POSISI AKTIF =====
         await managePositions(tickers);
 
-        // ===== 8. ANALISIS HANYA PAIR POTENSIAL =====
         const candidates = [];
-        const pairsToAnalyze = getHighPotentialPairs(tickers);
 
-        for (const pair of pairsToAnalyze) {
-            const t = tickers[pair];
+        for (const [pair, t] of Object.entries(tickers)) {
+            if (!pair.endsWith("_idr")) continue;
 
-            // Analisis lengkap hanya untuk kandidat potensial
+            const base = pair.split("_")[0];
+            if (BLACKLIST.has(base)) continue;
+            if (USE_WHITELIST && !WHITELIST.has(base)) continue;
+            if (Date.now() - (state.cooldown[pair] || 0) < CONFIG.COOLDOWN_MIN * 60000) continue;
+            if (state.positions[pair]) continue;
+
             const analysis = analyzer.evaluatePair(pair, t);
             if (analysis.score > 0) {
                 candidates.push({ pair, ticker: t, ...analysis });
@@ -2077,13 +2084,13 @@ async function scan() {
 
         candidates.sort((a, b) => b.score - a.score);
 
-        // ===== 9. DISPLAY DASHBOARD (RINGKAS) =====
+        // Display dashboard
         console.clear();
         console.log(`\x1b[36m╔══════════════════════════════════════════════════════════╗\x1b[0m`);
         console.log(`\x1b[36m║        PROFESSIONAL TRADING BOT v5.0 (API V2)           ║\x1b[0m`);
         console.log(`\x1b[36m╚══════════════════════════════════════════════════════════╝\x1b[0m\n`);
 
-        console.log(`📊 MARKET: ${marketRegime.regime} | ${marketRegime.trend}`);
+        console.log(`📊 MARKET REGIME: ${state.sentiment} | ${state.marketRegime}`);
         console.log(`💰 BALANCE: Rp ${formatIDR(state.equityNow)}`);
         console.log(`📉 DRAWDOWN: ${state.currentDrawdown.toFixed(2)}%`);
         console.log(`📊 DAILY LOSS: Rp ${formatIDR(state.dailyLoss)} / ${CONFIG.MAX_DAILY_LOSS}%\n`);
@@ -2093,28 +2100,110 @@ async function scan() {
             for (const [pair, pos] of Object.entries(state.positions)) {
                 const currentPrice = Number(tickers[pair]?.last || 0);
                 const pnl = currentPrice ? ((currentPrice - pos.entry) / pos.entry * 100) : 0;
-                console.log(`   ${pair.padEnd(10)} | ${pnl >= 0 ? '📈' : '📉'} ${pnl.toFixed(2)}%`);
+                const color = pnl >= 0 ? "\x1b[32m" : "\x1b[31m";
+                const livePriceFormatted = formatIDR(currentPrice);
+                const targetFormatted = formatIDR(pos.target);
+
+                console.log(`   ${pair.padEnd(10)} | ${color}${pnl.toFixed(2)}%\x1b[0m | Live: ${livePriceFormatted} | Target: ${targetFormatted}`);
+            }
+        } else {
+            console.log(`   No open positions`);
+        }
+
+        console.log(`\n🎯 TOP CANDIDATES:`);
+        candidates.slice(0, 5).forEach((c, i) => {
+            const color = c.score >= 8 ? "\x1b[32m" : c.score >= 6 ? "\x1b[33m" : "\x1b[0m";
+            console.log(`   ${i + 1}. ${c.pair.padEnd(10)} ${color}Score: ${c.score.toFixed(1)} RSI: ${c.rsi.toFixed(0)} Conf: ${(c.confidence * 100).toFixed(0)}%\x1b[0m`);
+        });
+
+        // MULTI-TIMEFRAME INSIGHT DENGAN WEIGHTED SCORE
+        console.log(`\n📊 MULTI-TIMEFRAME INSIGHT (${CONFIG.TIMEFRAMES.join('/')}m):`);
+        const topThree = candidates.slice(0, 3);
+        for (const c of topThree) {
+            const insight = multiTFAnalyzer.getInsight(c.pair, c.score);
+            if (insight?.consensus) {
+                const arrow = insight.consensus.direction === "BULLISH" ? "🟢" :
+                    insight.consensus.direction === "BEARISH" ? "🔴" : "⚪";
+
+                // Hitung weighted score
+                let weightedScore = c.score;
+                if (insight.consensus.direction === "BULLISH") {
+                    weightedScore += insight.consensus.consensusStrength * CONFIG.TF_BONUS_BULLISH;
+                } else if (insight.consensus.direction === "SIDEWAYS") {
+                    weightedScore += insight.consensus.consensusStrength * CONFIG.TF_BONUS_SIDEWAYS;
+                } else if (insight.consensus.direction === "BEARISH") {
+                    weightedScore += CONFIG.TF_PENALTY_BEARISH;
+                }
+
+                weightedScore = Math.min(10, Math.max(0, weightedScore));
+
+                console.log(`   ${c.pair.padEnd(12)} ${arrow} ${insight.consensus.direction} (${(insight.consensus.consensusStrength * 100).toFixed(0)}%)`);
+                console.log(`        Teknikal: ${c.score.toFixed(1)} | Weighted: ${weightedScore.toFixed(1)} | ${insight.canEnter ? '✅ LAYAK' : '⛔ SKIP'}`);
             }
         }
 
-        console.log(`\n🎯 TOP 5 CANDIDATES:`);
-        candidates.slice(0, 5).forEach((c, i) => {
-            console.log(`   ${i + 1}. ${c.pair.padEnd(10)} Score: ${c.score.toFixed(1)} RSI: ${c.rsi.toFixed(0)}`);
-        });
-
-        // ===== 10. EKSEKUSI TRADE (JIKA ADA) =====
+        // EXECUTE TRADES DENGAN ENHANCED MULTI-TF LOGIC
         const canTrade = riskManager.canTrade();
 
-        if (canTrade && Object.keys(state.positions).length < CONFIG.MAX_POSITIONS && !isBuying) {
-            for (const candidate of candidates.slice(0, 3)) {
-                if (isBuying) break;
+        if (canTrade && Object.keys(state.positions).length < CONFIG.MAX_POSITIONS) {
+            // Filter dan beri bobot multi-timeframe
+            const qualifiedCandidates = [];
 
-                const tfCheck = await multiTFAnalyzer.canEnter(candidate.pair, candidate.score);
+            for (const c of candidates) {
+                if (c.score < 6) continue;
+                if (marketRegime.regime.includes("BEAR") && c.score < 7) continue;
 
-                if (tfCheck.allowed || candidate.score >= 7.5) {
-                    console.log(`\n✅ Executing: ${candidate.pair}`);
-                    await executeBuy(candidate.pair, Number(candidate.ticker.last), candidate);
-                    break; // Hanya eksekusi 1 trade per scan
+                const tfCheck = multiTFAnalyzer.canEnter(c.pair, c.score);
+
+                // Hitung final score dengan bobot
+                let finalScore = c.score;
+                if (tfCheck.consensus) {
+                    if (tfCheck.consensus.direction === "BULLISH") {
+                        finalScore += tfCheck.consensus.consensusStrength * CONFIG.TF_BONUS_BULLISH;
+                    } else if (tfCheck.consensus.direction === "SIDEWAYS") {
+                        finalScore += tfCheck.consensus.consensusStrength * CONFIG.TF_BONUS_SIDEWAYS;
+                    } else if (tfCheck.consensus.direction === "BEARISH") {
+                        finalScore += CONFIG.TF_PENALTY_BEARISH;
+                    }
+                }
+
+                finalScore = Math.min(10, Math.max(0, finalScore));
+
+                qualifiedCandidates.push({
+                    ...c,
+                    tfCheck,
+                    finalScore,
+                    tfDirection: tfCheck.consensus?.direction || 'UNKNOWN',
+                    tfStrength: tfCheck.consensus?.consensusStrength || 0
+                });
+            }
+
+            // Urutkan berdasarkan finalScore
+            qualifiedCandidates.sort((a, b) => b.finalScore - a.finalScore);
+
+            const topPick = qualifiedCandidates[0];
+            if (topPick && !isBuying) {
+                console.log(`\n🎯 TOP PICK: ${topPick.pair}`);
+                console.log(`   Score Teknikal: ${topPick.score.toFixed(1)}`);
+                console.log(`   Multi-TF: ${topPick.tfDirection} (${(topPick.tfStrength * 100).toFixed(0)}%) | ${topPick.tfCheck.allowed ? '✅' : '⛔'}`);
+                console.log(`   Final Score: ${topPick.finalScore.toFixed(1)}`);
+
+                if (topPick.tfCheck.allowed || topPick.finalScore >= 7) {
+                    // Jika diizinkan atau final score tinggi, eksekusi
+                    console.log(`✅ MULTI-TF: ${topPick.pair} approved for entry`);
+                    await executeBuy(topPick.pair, Number(topPick.ticker.last), topPick);
+                } else {
+                    console.log(`⛔ Top pick ditolak oleh multi-timeframe`);
+
+                    // Cari kandidat berikutnya dengan final score tinggi
+                    const nextPick = qualifiedCandidates.find(c =>
+                        (c.tfCheck.allowed || c.finalScore >= 7) && c.pair !== topPick.pair
+                    );
+
+                    if (nextPick && !isBuying) {
+                        console.log(`🔄 Mencoba alternatif: ${nextPick.pair}`);
+                        await executeBuy(nextPick.pair, Number(nextPick.ticker.last), nextPick);
+                    }
                 }
             }
         }
@@ -2123,63 +2212,13 @@ async function scan() {
 
     } catch (err) {
         console.log("❌ Scan Error:", err.message);
+        if (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT') {
+            console.log("⚠️ Network error, but bot will continue...");
+        }
     }
 
-    // Scan interval lebih cepat (3 detik) karena lebih ringan
-    setTimeout(scan, 3000);
+    setTimeout(scan, CONFIG.SCAN_INTERVAL);
 }
-
-/* ======================================================
-   INITIALIZATION - DENGAN PRELOAD HISTORY
-====================================================== */
-
-(async () => {
-    console.log("🚀 Initializing Professional Trading Bot v5.0 (API V2)...");
-
-    try {
-        await initializeComponents();
-    } catch (e) {
-        console.log("\n❌ Failed to initialize components:", e.message);
-        process.exit(1);
-    }
-
-    console.log("🔌 Connecting to Indodax API...");
-    const info = await getAccountInfo();
-
-    if (info.success) {
-        console.log("✅ API Connection Successful");
-        console.log(`💰 Initial Balance: Rp ${formatIDR(state.equityNow)}`);
-
-        // PRELOAD: Ambil daftar pair yang pernah ditrade dari file
-        console.log("📊 Loading trade history from state...");
-
-        if (state.tradeHistory && state.tradeHistory.length > 0) {
-            console.log(`   Found ${state.tradeHistory.length} historical trades`);
-        }
-
-        // Sync pertama (lengkap)
-        console.log("📊 Initial trade history sync...");
-        await syncTradeHistory();
-
-        if (state.peakEquity === 0) {
-            state.peakEquity = state.equityNow;
-        }
-
-        await tg(
-            `🤖 Bot Started Successfully (API V2)\n` +
-            `Balance: Rp ${formatIDR(state.equityNow)}\n` +
-            `Active Pairs: ${Object.keys(state.positions).length}`,
-            "SUCCESS"
-        );
-
-        console.log("🔄 Starting optimized scanner loop...\n");
-        scan();
-    } else {
-        console.log("❌ Failed to connect to Indodax API");
-        process.exit(1);
-    }
-})();
-
 
 /* ======================================================
    PROCESS HANDLERS
