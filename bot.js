@@ -2005,6 +2005,11 @@ function getHighPotentialPairs(tickers) {
    OPTIMIZED SCAN FUNCTION
 ====================================================== */
 
+
+/* ======================================================
+   OPTIMIZED SCAN FUNCTION - DENGAN DISPLAY LENGKAP
+====================================================== */
+
 async function scan() {
     try {
         const sekarang = Date.now();
@@ -2077,13 +2082,13 @@ async function scan() {
 
         candidates.sort((a, b) => b.score - a.score);
 
-        // ===== 9. DISPLAY DASHBOARD (RINGKAS) =====
+        // ===== 9. DISPLAY DASHBOARD (LENGKAP SEPERTI PERMINTAAN) =====
         console.clear();
         console.log(`\x1b[36m╔══════════════════════════════════════════════════════════╗\x1b[0m`);
         console.log(`\x1b[36m║        PROFESSIONAL TRADING BOT v5.0 (API V2)           ║\x1b[0m`);
         console.log(`\x1b[36m╚══════════════════════════════════════════════════════════╝\x1b[0m\n`);
 
-        console.log(`📊 MARKET: ${marketRegime.regime} | ${marketRegime.trend}`);
+        console.log(`📊 MARKET REGIME: ${state.sentiment} | ${state.marketRegime}`);
         console.log(`💰 BALANCE: Rp ${formatIDR(state.equityNow)}`);
         console.log(`📉 DRAWDOWN: ${state.currentDrawdown.toFixed(2)}%`);
         console.log(`📊 DAILY LOSS: Rp ${formatIDR(state.dailyLoss)} / ${CONFIG.MAX_DAILY_LOSS}%\n`);
@@ -2093,28 +2098,111 @@ async function scan() {
             for (const [pair, pos] of Object.entries(state.positions)) {
                 const currentPrice = Number(tickers[pair]?.last || 0);
                 const pnl = currentPrice ? ((currentPrice - pos.entry) / pos.entry * 100) : 0;
-                console.log(`   ${pair.padEnd(10)} | ${pnl >= 0 ? '📈' : '📉'} ${pnl.toFixed(2)}%`);
+                const color = pnl >= 0 ? "\x1b[32m" : "\x1b[31m";
+                const livePriceFormatted = formatIDR(currentPrice);
+                const targetFormatted = formatIDR(pos.target);
+
+                // FORMAT SESUAI PERMINTAAN ANDA
+                console.log(`   ${pair.padEnd(10)} | ${color}${pnl.toFixed(2)}%\x1b[0m | Live: ${livePriceFormatted} | Target: ${targetFormatted}`);
             }
+        } else {
+            console.log(`   No open positions`);
         }
 
-        console.log(`\n🎯 TOP 5 CANDIDATES:`);
+        console.log(`\n🎯 TOP CANDIDATES:`);
         candidates.slice(0, 5).forEach((c, i) => {
-            console.log(`   ${i + 1}. ${c.pair.padEnd(10)} Score: ${c.score.toFixed(1)} RSI: ${c.rsi.toFixed(0)}`);
+            const color = c.score >= 8 ? "\x1b[32m" : c.score >= 6 ? "\x1b[33m" : "\x1b[0m";
+            console.log(`   ${i + 1}. ${c.pair.padEnd(10)} ${color}Score: ${c.score.toFixed(1)} RSI: ${c.rsi.toFixed(0)} Conf: ${(c.confidence * 100).toFixed(0)}%\x1b[0m`);
         });
+
+        // MULTI-TIMEFRAME INSIGHT DENGAN WEIGHTED SCORE
+        console.log(`\n📊 MULTI-TIMEFRAME INSIGHT (${CONFIG.TIMEFRAMES.join('/')}m):`);
+        const topThree = candidates.slice(0, 3);
+        for (const c of topThree) {
+            const insight = multiTFAnalyzer.getInsight(c.pair, c.score);
+            if (insight?.consensus) {
+                const arrow = insight.consensus.direction === "BULLISH" ? "🟢" :
+                    insight.consensus.direction === "BEARISH" ? "🔴" : "⚪";
+
+                // Hitung weighted score
+                let weightedScore = c.score;
+                if (insight.consensus.direction === "BULLISH") {
+                    weightedScore += insight.consensus.consensusStrength * CONFIG.TF_BONUS_BULLISH;
+                } else if (insight.consensus.direction === "SIDEWAYS") {
+                    weightedScore += insight.consensus.consensusStrength * CONFIG.TF_BONUS_SIDEWAYS;
+                } else if (insight.consensus.direction === "BEARISH") {
+                    weightedScore += CONFIG.TF_PENALTY_BEARISH;
+                }
+
+                weightedScore = Math.min(10, Math.max(0, weightedScore));
+
+                console.log(`   ${c.pair.padEnd(12)} ${arrow} ${insight.consensus.direction} (${(insight.consensus.consensusStrength * 100).toFixed(0)}%)`);
+                console.log(`        Teknikal: ${c.score.toFixed(1)} | Weighted: ${weightedScore.toFixed(1)} | ${insight.canEnter ? '✅ LAYAK' : '⛔ SKIP'}`);
+            }
+        }
 
         // ===== 10. EKSEKUSI TRADE (JIKA ADA) =====
         const canTrade = riskManager.canTrade();
 
         if (canTrade && Object.keys(state.positions).length < CONFIG.MAX_POSITIONS && !isBuying) {
-            for (const candidate of candidates.slice(0, 3)) {
-                if (isBuying) break;
+            // Filter dan beri bobot multi-timeframe
+            const qualifiedCandidates = [];
 
-                const tfCheck = await multiTFAnalyzer.canEnter(candidate.pair, candidate.score);
+            for (const c of candidates) {
+                if (c.score < 6) continue;
+                if (marketRegime.regime.includes("BEAR") && c.score < 7) continue;
 
-                if (tfCheck.allowed || candidate.score >= 7.5) {
-                    console.log(`\n✅ Executing: ${candidate.pair}`);
-                    await executeBuy(candidate.pair, Number(candidate.ticker.last), candidate);
-                    break; // Hanya eksekusi 1 trade per scan
+                const tfCheck = multiTFAnalyzer.canEnter(c.pair, c.score);
+
+                // Hitung final score dengan bobot
+                let finalScore = c.score;
+                if (tfCheck.consensus) {
+                    if (tfCheck.consensus.direction === "BULLISH") {
+                        finalScore += tfCheck.consensus.consensusStrength * CONFIG.TF_BONUS_BULLISH;
+                    } else if (tfCheck.consensus.direction === "SIDEWAYS") {
+                        finalScore += tfCheck.consensus.consensusStrength * CONFIG.TF_BONUS_SIDEWAYS;
+                    } else if (tfCheck.consensus.direction === "BEARISH") {
+                        finalScore += CONFIG.TF_PENALTY_BEARISH;
+                    }
+                }
+
+                finalScore = Math.min(10, Math.max(0, finalScore));
+
+                qualifiedCandidates.push({
+                    ...c,
+                    tfCheck,
+                    finalScore,
+                    tfDirection: tfCheck.consensus?.direction || 'UNKNOWN',
+                    tfStrength: tfCheck.consensus?.consensusStrength || 0
+                });
+            }
+
+            // Urutkan berdasarkan finalScore
+            qualifiedCandidates.sort((a, b) => b.finalScore - a.finalScore);
+
+            const topPick = qualifiedCandidates[0];
+            if (topPick && !isBuying) {
+                console.log(`\n🎯 TOP PICK: ${topPick.pair}`);
+                console.log(`   Score Teknikal: ${topPick.score.toFixed(1)}`);
+                console.log(`   Multi-TF: ${topPick.tfDirection} (${(topPick.tfStrength * 100).toFixed(0)}%) | ${topPick.tfCheck.allowed ? '✅' : '⛔'}`);
+                console.log(`   Final Score: ${topPick.finalScore.toFixed(1)}`);
+
+                if (topPick.tfCheck.allowed || topPick.finalScore >= 7) {
+                    // Jika diizinkan atau final score tinggi, eksekusi
+                    console.log(`✅ MULTI-TF: ${topPick.pair} approved for entry`);
+                    await executeBuy(topPick.pair, Number(topPick.ticker.last), topPick);
+                } else {
+                    console.log(`⛔ Top pick ditolak oleh multi-timeframe`);
+
+                    // Cari kandidat berikutnya dengan final score tinggi
+                    const nextPick = qualifiedCandidates.find(c =>
+                        (c.tfCheck.allowed || c.finalScore >= 7) && c.pair !== topPick.pair
+                    );
+
+                    if (nextPick && !isBuying) {
+                        console.log(`🔄 Mencoba alternatif: ${nextPick.pair}`);
+                        await executeBuy(nextPick.pair, Number(nextPick.ticker.last), nextPick);
+                    }
                 }
             }
         }
@@ -2123,6 +2211,9 @@ async function scan() {
 
     } catch (err) {
         console.log("❌ Scan Error:", err.message);
+        if (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT') {
+            console.log("⚠️ Network error, but bot will continue...");
+        }
     }
 
     // Scan interval lebih cepat (3 detik) karena lebih ringan
